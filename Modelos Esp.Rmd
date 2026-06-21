@@ -1,0 +1,166 @@
+---
+title: "Modelo lineal"
+author: "Christian Amaro"
+date: "2025-04-21"
+output:
+  html_document:
+    df_print: paged
+---
+
+El propósito de esta sección es realizar la ingesta y la limpieza inicial de los datos requeridos para construir un modelo predictivo orientado a estimar los gastos relacionados con las existencias de bovinos en las unidades de producción.
+
+
+```{r include=FALSE}
+set.seed(123)
+
+library(tidyverse)
+library(readxl)
+library(corrplot)
+library(writexl)
+library(car)
+library(lmtest)
+
+```
+
+# Contexto del Tratamiento de Datos
+El script importa la matriz de datos y estandariza la nomenclatura de la variable dependiente. Posteriormente, ejecuta un tratamiento cíclico sobre los valores nulos (NA). Es importante mencionar que, para el alcance de este modelo, los NA no representan errores de captura ni valores perdidos, sino ceros estructurales; es decir, reflejan la inexistencia física de inventario existencias de ganado en una unidad de producción específica.
+
+
+```{r}
+datos <- read_xlsx(path = "BASE.xlsx", sheet = 1,col_names = T)
+
+datos <- datos %>% rename(Existencias = NUEVA)
+
+# nombres de variables para ciclo for 
+
+variables <- colnames(datos)
+
+# se quitan los NA y se convierten en 0
+
+for (var in variables) {
+
+ datos[[var]] <- ifelse(is.na(datos[[var]]), 0, datos[[var]])
+  
+}
+
+
+```
+
+Gráfico de correlación para determinar si hay alguna correlación positiva o negativa de existencias con los gastos de las unidades de producción. 
+
+```{r, warning=FALSE}
+corrplot(cor(datos %>% select(-ID_CA2022_UP)), type = "upper", method = "square",addgrid.col = T)
+
+
+```
+
+
+# Escalamiento Logarítmico de las Variables
+En esta etapa del flujo de trabajo, se aplica una transformación logarítmica a las variables numéricas del modelo utilizando la función log1p. Esta elección matemática es fundamental debido a la naturaleza de los datos, ya que al haber gestionado previamente los valores nulos como ceros estructurales (unidades de producción sin inventario o sin gastos), un logaritmo convencional habría generado indeterminaciones de infinito negativo. La función calcula el logaritmo de la variable más uno, lo que permite conservar el valor cero de forma consistente, estabilizar la varianza de las variables económicas que típicamente muestran una distribución asimétrica hacia la derecha y suavizar el impacto de los valores extremos para mejorar el rendimiento del algoritmo predictivo.
+
+# Depuración del Conjunto de Datos
+Una vez transformadas las variables a la escala adecuada, se procede a la eliminación de las columnas redundantes o irrelevantes que no aportan valor explicativo al modelo de gastos. Para asegurar la robustez del código ante posibles cambios en el orden del archivo de origen, esta limpieza se realiza mediante una selección negativa por nombre de variable, evitando el uso de índices posicionales y garantizando un script reproducible y legible.
+
+
+```{r}
+## aplicamos logaritmos para escalar las variables 
+datos_log <- datos %>% mutate(across(c(CG111_01, CB112, CP112, CO112, CC112, CB121_01, CB121_08,CB121_02,CB121_03, CB121_04, CB121_06, CP121_01, CP121_02, CP121_05, CP121_06,CP121_07, CP121_08, CA114_01, CA114_02, CA114_03, CA114_04, CO113_01,CO113_02, CO113_03, CC113, Existencias), ~ log1p(.)))
+
+# quitamos las variables innecesarias
+
+gastos <- datos_log %>% select(-c(ID_CA2022_UP, CG111_02, CG111_03 ))
+
+```
+
+
+# Preparación y estructura mediante estandarización
+Esta fase del código prepara la estructura de los datos mediante la partición muestral y la estandarización de variables. Inicialmente, se divide la muestra aleatoriamente, asignando un ochenta por ciento al conjunto de entrenamiento y el veinte por ciento restante a la validación o conjunto de test, lo que garantiza que el modelo se evalúe sobre observaciones no vistas. Posteriormente, se aplica una normalización Z-score $z = \frac{x - \mu}{\sigma}$ a las características numéricas para situarlas en una escala común de media cero y desviación estándar uno, optimizando así la convergencia matemática del algoritmo. Lo que es áltamente importante en este bloque y que se debe hacer énfasis, es es la prevención de la filtración de datos o data leakage. Para estandarizar el conjunto de prueba, el script omite recalcular sus propios estadísticos poblacionales y, en su lugar, proyecta dinámicamente la media y desviación estándar extraídas exclusivamente del entorno de entrenamiento mediante la función cur_column. Utilizando esta función y el conjunto de entrenamiento, evitamos que cualquier información pase a ser captada por el modelo, evitando un sesgo a partir cualquier información que esté dentro del conjunto de validación. 
+
+
+
+```{r}
+# obtenemos índices para selección de la muestra test y training
+indices <- sample(x = 1:nrow(gastos), size = .80 * nrow(gastos))
+
+training <-  gastos[indices,]
+testing <- gastos[-indices,]
+
+# escalamos las variables restando la media y dividiendo entre la desviación estandar de las variables de entrenamiento
+
+training <- training  %>%  mutate(across(c(CB112, CP112, CO112, CC112, CB121_01, CB121_08,CB121_02,CB121_03, CB121_04, CB121_06, CP121_01, CP121_02, CP121_05, CP121_06,CP121_07, CP121_08, CA114_01, CA114_02, CA114_03, CA114_04, CO113_01,CO113_02, CO113_03, CC113, Existencias) , ~ ((. - mean(.)) / sd(.))))
+
+# hacemos lo mismo con el testing, pero aplicamos los valores de media y desvest del conjunto de training para evitar el data leakeage
+
+testing_norm <- testing %>% mutate(across(c(CB112, CP112, CO112, CC112, CB121_01, CB121_08,CB121_02,CB121_03, CB121_04, CB121_06, CP121_01, CP121_02, CP121_05, CP121_06,CP121_07, CP121_08, CA114_01, CA114_02, CA114_03, CA114_04, CO113_01,CO113_02, CO113_03, CC113, Existencias), 
+~ ((. - mean(training[[cur_column()]])) / sd(training[[cur_column()]])
+   )))
+```
+
+# Creación del modelo, pruebas de homocedasticidad y multicolinealidad
+Esta sección del proyecto aborda el ajuste del modelo lineal inicial y la evaluación diagnóstica de sus supuestos mediante pruebas estadísticas críticas para la validez de la inferencia. Se utiliza la función lm para ajustar una regresión lineal por mínimos cuadrados ordinarios, tomando CG111_01 (gastos de la unidad de producción) como variable dependiente frente al resto de los predictores del conjunto de entrenamiento, seguido de un análisis integral de sus residuos con summary y plot. Para garantizar la fiabilidad de los coeficientes, el script ejecuta la prueba de Breusch-Pagan (bptest) para detectar heterocedasticidad y calcula los Factores de Inflación de la Varianza (vif) para identificar multicolinealidad. Es técnicamente valioso precisar en la documentación que el diagnóstico de multicolinealidad es un proceso iterativo; si una variable supera el umbral de aceptación (un VIF mayor a 5 o 10), su exclusión exige reajustar el modelo para recalcular los nuevos factores del sistema. Asimismo, si la prueba de Breusch-Pagan rechaza la hipótesis de homocedasticidad, los errores estándar convencionales pierden validez.
+
+```{r}
+# obtenemos un primer modelo con la función lm para modelos lineales utilizando el dataset training para entrenar el modelo
+modelo1 <- lm(formula = CG111_01 ~ ., data = training)
+
+summary(modelo1)
+
+#predict(modelo1, newdata = testing)
+plot(modelo1)
+
+bptest(modelo1)
+
+# Esta función verifica que las variables no tengan multicolinealidad, si alguna presenta un valor de 5 o 10 siendo menos estrictos, se descarta
+
+vif(modelo1)
+```
+
+# Refinamiento y Diagnóstico Final
+Este bloque optimiza la arquitectura del modelo mediante un proceso de eliminación hacia atrás. Al excluir sistemáticamente las variables predictoras que carecen de significancia estadística o que presentan una alta multicolinealidad, se mitiga el sobreajuste y se consolida una regresión parsimoniosa y numéricamente estable.
+
+Una vez reajustada la ecuación, el modelo se somete a una validación para garantizar la fiabilidad empírica de sus estimadores. La función summary cuantifica el nuevo nivel explicativo, mientras que las gráficas de residuales permiten inspeccionar la linealidad y normalidad de los errores. Simultáneamente, la prueba de Breusch-Pagan evalúa la constancia de la varianza (un p-valor menor a 0.05 confirmaría heterocedasticidad), y un recálculo final del VIF certifica la erradicación absoluta de la redundancia estructural.
+
+
+```{r}
+# Modelo con las variables con más significancia, eliminando las variables con multicolinealidad
+
+modelo1_ajustado <- lm(CG111_01 ~ CC112   + CB121_01  +  CB121_08   + CB121_02  +  CB121_03   + CB121_04  +  CB121_06+ CP121_05   + CP121_06    +CP121_07 +   CP121_08  +  CA114_01   + CA114_02    +CA114_03 +   CA114_04+ CO113_02+ CC113, training) 
+
+summary(modelo1_ajustado)
+
+#Ploteamos los residuales 
+plot(modelo1_ajustado)
+
+#Prueba de homocedasticidad, si sale pvalue menor a .05 indica presencia de heterocedasticidad
+bptest(modelo1_ajustado)
+ 
+# Verificamos las variables con mayor significancia 
+
+vif(modelo1_ajustado)
+```
+
+# Validación Externa y Evaluación de Rendimiento
+Esta última fase evalúa la precisión empírica del modelo sobre el conjunto de prueba. Inicialmente, las predicciones se calculan utilizando la muestra estandarizada para mantener la coherencia algorítmica. Un paso metodológico crítico es la reversión de escala: mediante el uso de la función exponencial inversa (expm1), se neutraliza la transformación logarítmica previa para devolver las estimaciones a su escala nominal. Finalmente, se calculan los residuales y la Raíz del Error Cuadrático Medio (RMSE), una métrica que cuantifica la magnitud promedio del error predictivo directamente en las unidades económicas originales del problema.
+
+```{r}
+# Generamos las predicciiones con el modelo testing con variables escaladas y las pegamos como nueva columna
+testing$predicciones <- predict(object = modelo1_ajustado, newdata = testing_norm)
+
+#aplicamos función exponencial para revertir la transformación logarítmica
+testing <- testing %>% mutate(datos_reales = expm1(CG111_01), predicciones = expm1(predicciones))
+
+# Obtenemos residuales
+residuales <- testing$datos_reales - testing$predicciones
+
+
+RMSE <- sqrt(mean(residuales^2))
+print(RMSE)
+
+```
+# Conclusiones
+
+Se ejecutó un análisis riguroso con la depuración metodológica adecuada sobre las variables predictoras relacionadas con las existencias bovinas; sin embargo, este mismo ejercicio deja en evidencia las limitaciones estructurales del método de regresión lineal ordinaria cuando se aplica a datos complejos de naturaleza económica. El diagnóstico de multicolinealidad presenta datos favorables, ya que los Factores de Inflación de la Varianza (VIF) calculados para todas las variables retenidas no exceden un valor de 2.66. Esto determina que la selección de características se hizo de manera óptima, evidenciando una matriz de datos que presenta predictores matemáticamente independientes.
+
+Respecto a la evaluación de los residuales, la prueba de Breusch-Pagan arroja un valor estadístico de 655.71 con un p-valor prácticamente igual a cero. Con esto existe evidencia estadística contundente para rechazar la hipótesis de homocedasticidad, significando así que la varianza de los residuales no es constante. Finalmente, el modelo presenta un $R^2$ de 0.13, un valor bajo para el modelo definitivo. Cabe recalcar que al momento de ejecutar el primer modelo con todas las variables se obtuvo un $R^2$ de 0.29; esto no significa que el modelo original fuera mejor, sino que antes de eliminar variables existía una inflación matemática y una redundancia explicativa importante. Por lo tanto, correr el diagnóstico VIF y depurar las variables nos arrojó un modelo más parsimonioso y sin sobreajuste estructural.
+
+Este modelo no pretende ejecutar un análisis con el objetivo de obtener predicciones exactas, sino mostrar un análisis con la metodología estadística correcta, ilustrando cómo se debe ejecutar un entrenamiento de datos riguroso previniendo la filtración de información (data leakage), eliminando variables con multicolinealidad y ejecutando el escalado de variables. Aunque en este modelo no haya sido estrictamente necesario que todas estas intervenciones forzaran la convergencia, su implementación es vital. Finalmente, el valor principal radica en encontrar e interpretar resultados de manera fidedigna con datos reales que, por su naturaleza, se alejan drásticamente del ideal de una distribución normal empírica.

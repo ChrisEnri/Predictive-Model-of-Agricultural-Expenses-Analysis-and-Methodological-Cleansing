@@ -1,0 +1,166 @@
+---
+title: "Linear model"
+author: "Christian Amaro"
+date: "2025-04-21"
+output:
+  html_document:
+    df_print: paged
+---
+
+The purpose of this section is to perform the ingestion and initial cleaning of the data required to build a predictive model aimed at estimating the expenses related to cattle stock in production units.
+
+
+```{r include=FALSE}
+set.seed(123)
+
+library(tidyverse)
+library(readxl)
+library(corrplot)
+library(writexl)
+library(car)
+library(lmtest)
+
+```
+
+# Data Treatment Context
+The script imports the data matrix and standardizes the nomenclature of the dependent variable. Subsequently, it performs a cyclic treatment over the null values (NA). It is important to mention that, for the scope of this model, the NA values do not represent capture errors or missing values, but rather structural zeros; that is, they reflect the physical absence of livestock stock inventory in a specific production unit.
+
+
+```{r}
+datos <- read_xlsx(path = "BASE.xlsx", sheet = 1,col_names = T)
+
+datos <- datos %>% rename(Existencias = NUEVA)
+
+# variable names for the for loop
+
+variables <- colnames(datos)
+
+# NA values are removed and converted to 0
+
+for (var in variables) {
+
+ datos[[var]] <- ifelse(is.na(datos[[var]]), 0, datos[[var]])
+  
+}
+
+
+```
+
+Correlation plot to determine whether there is any positive or negative correlation between stock and the expenses of the production units.
+
+```{r, warning=FALSE}
+corrplot(cor(datos %>% select(-ID_CA2022_UP)), type = "upper", method = "square",addgrid.col = T)
+
+
+```
+
+
+# Logarithmic Scaling of the Variables
+At this stage of the workflow, a logarithmic transformation is applied to the numeric variables of the model using the log1p function. This mathematical choice is fundamental due to the nature of the data, since having previously handled the null values as structural zeros (production units with no inventory or no expenses), a conventional logarithm would have generated negative infinity indeterminacies. The function computes the logarithm of the variable plus one, which allows the zero value to be preserved consistently, stabilizes the variance of the economic variables that typically show a right-skewed distribution, and smooths the impact of extreme values to improve the performance of the predictive algorithm.
+
+# Dataset Cleaning
+Once the variables are transformed to the appropriate scale, we proceed to remove the redundant or irrelevant columns that do not provide explanatory value to the expense model. To ensure the robustness of the code against possible changes in the order of the source file, this cleaning is performed through a negative selection by variable name, avoiding the use of positional indices and guaranteeing a reproducible and readable script.
+
+
+```{r}
+## we apply logarithms to scale the variables
+datos_log <- datos %>% mutate(across(c(CG111_01, CB112, CP112, CO112, CC112, CB121_01, CB121_08,CB121_02,CB121_03, CB121_04, CB121_06, CP121_01, CP121_02, CP121_05, CP121_06,CP121_07, CP121_08, CA114_01, CA114_02, CA114_03, CA114_04, CO113_01,CO113_02, CO113_03, CC113, Existencias), ~ log1p(.)))
+
+# we remove the unnecessary variables
+
+gastos <- datos_log %>% select(-c(ID_CA2022_UP, CG111_02, CG111_03 ))
+
+```
+
+
+# Preparation and Structuring through Standardization
+This phase of the code prepares the data structure through sample partitioning and variable standardization. Initially, the sample is split randomly, assigning eighty percent to the training set and the remaining twenty percent to the validation or test set, which ensures that the model is evaluated on unseen observations. Subsequently, a Z-score normalization $$z = \frac{x - \mu}{\sigma}$$ is applied to the numeric features to place them on a common scale of mean zero and standard deviation one, thus optimizing the mathematical convergence of the algorithm. What is highly important in this block, and must be emphasized, is the prevention of data leakage. To standardize the test set, the script omits recalculating its own population statistics and, instead, dynamically projects the mean and standard deviation extracted exclusively from the training environment through the cur_column function. By using this function and the training set, we prevent any information from being captured by the model, avoiding a bias arising from any information contained within the validation set.
+
+
+
+```{r}
+# we obtain indices to select the test and training samples
+indices <- sample(x = 1:nrow(gastos), size = .80 * nrow(gastos))
+
+training <-  gastos[indices,]
+testing <- gastos[-indices,]
+
+# we scale the variables by subtracting the mean and dividing by the standard deviation of the training variables
+
+training <- training  %>%  mutate(across(c(CB112, CP112, CO112, CC112, CB121_01, CB121_08,CB121_02,CB121_03, CB121_04, CB121_06, CP121_01, CP121_02, CP121_05, CP121_06,CP121_07, CP121_08, CA114_01, CA114_02, CA114_03, CA114_04, CO113_01,CO113_02, CO113_03, CC113, Existencias) , ~ ((. - mean(.)) / sd(.))))
+
+# we do the same with the testing set, but apply the mean and sd values from the training set to avoid data leakage
+
+testing_norm <- testing %>% mutate(across(c(CB112, CP112, CO112, CC112, CB121_01, CB121_08,CB121_02,CB121_03, CB121_04, CB121_06, CP121_01, CP121_02, CP121_05, CP121_06,CP121_07, CP121_08, CA114_01, CA114_02, CA114_03, CA114_04, CO113_01,CO113_02, CO113_03, CC113, Existencias), 
+~ ((. - mean(training[[cur_column()]])) / sd(training[[cur_column()]])
+   )))
+```
+
+# Model Building, Homoscedasticity and Multicollinearity Tests
+This section of the project addresses the fitting of the initial linear model and the diagnostic evaluation of its assumptions through statistical tests that are critical for the validity of the inference. The lm function is used to fit an ordinary least squares linear regression, taking CG111_01 (production unit expenses) as the dependent variable against the rest of the predictors in the training set, followed by a comprehensive analysis of its residuals with summary and plot. To ensure the reliability of the coefficients, the script runs the Breusch-Pagan test (bptest) to detect heteroscedasticity and computes the Variance Inflation Factors (vif) to identify multicollinearity. It is technically valuable to specify in the documentation that the multicollinearity diagnosis is an iterative process; if a variable exceeds the acceptance threshold (a VIF greater than 5 or 10), its exclusion requires refitting the model to recompute the new factors of the system. Likewise, if the Breusch-Pagan test rejects the homoscedasticity hypothesis, the conventional standard errors lose their validity.
+
+```{r}
+# we obtain a first model with the lm function for linear models using the training dataset to train the model
+modelo1 <- lm(formula = CG111_01 ~ ., data = training)
+
+summary(modelo1)
+
+#predict(modelo1, newdata = testing)
+plot(modelo1)
+
+bptest(modelo1)
+
+# This function verifies that the variables do not have multicollinearity; if any presents a value of 5 or 10 being less strict, it is discarded
+
+vif(modelo1)
+```
+
+# Refinement and Final Diagnosis
+This block optimizes the model architecture through a backward elimination process. By systematically excluding the predictor variables that lack statistical significance or that present high multicollinearity, overfitting is mitigated and a parsimonious and numerically stable regression is consolidated.
+
+Once the equation is refitted, the model is subjected to validation to guarantee the empirical reliability of its estimators. The summary function quantifies the new explanatory level, while the residual plots allow inspection of the linearity and normality of the errors. Simultaneously, the Breusch-Pagan test evaluates the constancy of the variance (a p-value lower than 0.05 would confirm heteroscedasticity), and a final recalculation of the VIF certifies the absolute eradication of structural redundancy.
+
+
+```{r}
+# Model with the most significant variables, removing the variables with multicollinearity
+
+modelo1_ajustado <- lm(CG111_01 ~ CC112   + CB121_01  +  CB121_08   + CB121_02  +  CB121_03   + CB121_04  +  CB121_06+ CP121_05   + CP121_06    +CP121_07 +   CP121_08  +  CA114_01   + CA114_02    +CA114_03 +   CA114_04+ CO113_02+ CC113, training) 
+
+summary(modelo1_ajustado)
+
+# We plot the residuals
+plot(modelo1_ajustado)
+
+# Homoscedasticity test; if the p-value is lower than .05 it indicates the presence of heteroscedasticity
+bptest(modelo1_ajustado)
+ 
+# We verify the most significant variables
+
+vif(modelo1_ajustado)
+```
+
+# External Validation and Performance Evaluation
+This final phase evaluates the empirical accuracy of the model on the test set. Initially, the predictions are computed using the standardized sample to maintain algorithmic consistency. A critical methodological step is the scale reversal: through the use of the inverse exponential function (expm1), the previous logarithmic transformation is neutralized to return the estimates to their nominal scale. Finally, the residuals and the Root Mean Square Error (RMSE) are computed, a metric that quantifies the average magnitude of the predictive error directly in the original economic units of the problem.
+
+```{r}
+# We generate the predictions with the testing model using scaled variables and attach them as a new column
+testing$predicciones <- predict(object = modelo1_ajustado, newdata = testing_norm)
+
+# we apply the exponential function to revert the logarithmic transformation
+testing <- testing %>% mutate(datos_reales = expm1(CG111_01), predicciones = expm1(predicciones))
+
+# We obtain the residuals
+residuales <- testing$datos_reales - testing$predicciones
+
+
+RMSE <- sqrt(mean(residuales^2))
+print(RMSE)
+
+```
+# Conclusions
+
+A rigorous analysis was carried out with the appropriate methodological cleaning over the predictor variables related to cattle stock; however, this same exercise reveals the structural limitations of the ordinary linear regression method when applied to complex data of an economic nature. The multicollinearity diagnosis presents favorable data, since the Variance Inflation Factors (VIF) computed for all retained variables do not exceed a value of 2.66. This determines that the feature selection was performed optimally, evidencing a data matrix that presents mathematically independent predictors.
+
+Regarding the evaluation of the residuals, the Breusch-Pagan test yields a statistic of 655.71 with a p-value practically equal to zero. With this, there is overwhelming statistical evidence to reject the homoscedasticity hypothesis, meaning that the variance of the residuals is not constant. Finally, the model presents an $$R^2$$ of 0.13, a low value for the definitive model. It is worth noting that when running the first model with all variables, an $$R^2$$ of 0.29 was obtained; this does not mean that the original model was better, but rather that before removing variables there was a mathematical inflation and a significant explanatory redundancy. Therefore, running the VIF diagnosis and cleaning the variables yielded a more parsimonious model without structural overfitting.
+
+This model does not intend to perform an analysis with the goal of obtaining exact predictions, but rather to demonstrate an analysis with the correct statistical methodology, illustrating how a rigorous data training should be executed, preventing information leakage (data leakage), removing variables with multicollinearity, and performing variable scaling. Although in this model it was not strictly necessary for all these interventions to force convergence, their implementation is vital. Finally, the main value lies in finding and interpreting results faithfully with real data that, by their nature, deviate drastically from the ideal of an empirical normal distribution.
